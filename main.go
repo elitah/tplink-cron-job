@@ -220,12 +220,42 @@ func main() {
 					if _, err := GCron.AddFunc(
 						reboot,
 						func() {
-							httpResponse(
-								dsUrl,
-								"application/json; charset=UTF-8",
-								reboot_request,
-								nil,
-							)
+							go func() {
+								//
+								retry := 0
+								//
+								start := time.Now()
+								//
+								for 5 > retry {
+									//
+									if 30*time.Minute < time.Since(start) {
+										//
+										fmt.Println("timeout execute")
+										//
+										return
+									}
+									//
+									if "" != dsUrl {
+										if err := httpResponse(
+											dsUrl,
+											"application/json; charset=UTF-8",
+											reboot_request,
+											nil,
+										); nil == err {
+											return
+										} else if errors.Is(err, syscall.EACCES) {
+											//
+											retry++
+											//
+											time.Sleep(10 * time.Second)
+											//
+											continue
+										}
+									}
+									//
+									time.Sleep(3 * time.Second)
+								}
+							}()
 						},
 					); nil != err {
 						fmt.Println(err)
