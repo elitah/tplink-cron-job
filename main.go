@@ -26,8 +26,184 @@ const (
 )
 
 var (
+	GHTTPLimit = make(chan byte, 1)
+
 	GCron = cron.New(cron.WithSeconds())
 )
+
+type SpeedLimitValue struct {
+	name string
+
+	next time.Time
+
+	upList   [5]int64
+	downList [5]int64
+
+	upIndex   int
+	downIndex int
+
+	upLimit   int64
+	downLimit int64
+}
+
+func (this *SpeedLimitValue) Update(name string, up, down, up_limit, down_limit int64) {
+	this.name = name
+
+	this.upList[this.upIndex] = up
+	this.downList[this.downIndex] = down
+
+	this.upIndex++
+	this.downIndex++
+
+	if len(this.upList) <= this.upIndex {
+		this.upIndex = 0
+	}
+
+	if len(this.downList) <= this.downIndex {
+		this.downIndex = 0
+	}
+
+	this.upLimit = up_limit
+	this.downLimit = down_limit
+}
+
+func (this *SpeedLimitValue) Avg(up bool) (result int64) {
+	//
+	avg := true
+	//
+	list := this.upList[:]
+	//
+	if 0 < this.upLimit {
+		//
+		avg = false
+	}
+	//
+	if !up {
+		//
+		list = this.downList[:]
+		//
+		if 0 < this.downLimit {
+			//
+			avg = false
+		} else {
+			//
+			avg = true
+		}
+	}
+	//
+	n := int64(len(list))
+	//
+	for _, item := range list {
+		//
+		if avg {
+			result += item
+		} else if result < item {
+			result = item
+		}
+	}
+	//
+	if avg {
+		result /= n
+	}
+	//
+	return
+}
+
+type SpeedLimit struct {
+	up   int64
+	down int64
+
+	m map[string]*SpeedLimitValue
+}
+
+func (this *SpeedLimit) Checking(fn func(string, string, int64, int64)) {
+	//
+	var up, down int64
+	//
+	nowtime := time.Now()
+	//
+	for k, v := range this.m {
+		//
+		if nowtime.After(v.next) {
+			//
+			_up := v.Avg(true)
+			_down := v.Avg(false)
+			//
+			if this.up < _up {
+				up = this.up / 1024
+			} else if int64(float32(this.up)*0.6) > _up {
+				up = 0
+			} else {
+				up = v.upLimit
+			}
+			//
+			if this.down < _down {
+				down = this.down / 1024
+			} else if int64(float32(this.down)*0.6) > _down {
+				down = 0
+			} else {
+				down = v.downLimit
+			}
+			//
+			if (up != v.upLimit) || (down != v.downLimit) {
+				//
+				fn(k, v.name, up, down)
+				//
+				fmt.Printf("\033[31;1m%s\033[0m: Set to %6d/%6d KB/s, Avg: %6d/%6d KB/s, Limit: %6d/%6d KB/s\n", k, up, down, _up/1024, _down/1024, v.upLimit, v.downLimit)
+			}
+			//
+			v.next = nowtime.Add(3 * time.Second)
+		}
+	}
+}
+
+func (this *SpeedLimit) Update(mac, name string, up, down, up_limit, down_limit int64) {
+	//
+	//fmt.Println(mac)
+	//
+	if "" != mac {
+		//
+		v, ok := this.m[mac]
+		//
+		if !ok {
+			//
+			v = &SpeedLimitValue{}
+			//
+			this.m[mac] = v
+		}
+		//
+		v.Update(name, up, down, up_limit, down_limit)
+	}
+}
+
+func (this *SpeedLimit) String() string {
+	//
+	var s strings.Builder
+	//
+	fmt.Fprintln(
+		&s,
+		"====================================================================",
+	)
+	//
+	for k, v := range this.m {
+		//
+		v0 := v.Avg(true)
+		v1 := v.Avg(false)
+		//
+		if this.up < v0 || this.down < v1 {
+			//
+			fmt.Fprintf(
+				&s,
+				"%s: Up: %d(%v %v), Down: %d(%v %v)\n",
+				k,
+				v0, v.upList[v.upIndex:], v.upList[:v.upIndex],
+				v1, v.downList[v.downIndex:], v.downList[:v.downIndex],
+			)
+		}
+	}
+	//
+	return s.String()
+}
 
 type WANInfo struct {
 	IpAddr     string `json:"ipaddr"`
@@ -38,9 +214,9 @@ type WANInfo struct {
 	LinkStatus int    `json:"link_status"`
 	ErrorCode  int    `json:"error_code"`
 	Proto      string `json:"proto"`
-	UpTime     int    `json:"up_time"`
-	UpSpeed    int    `json:"up_speed"`
-	DownSpeed  int    `json:"down_speed"`
+	UpTime     int64  `json:"up_time"`
+	UpSpeed    int64  `json:"up_speed"`
+	DownSpeed  int64  `json:"down_speed"`
 	PhyStatus  int    `json:"phy_status"`
 }
 
@@ -50,10 +226,10 @@ type HostInfo struct {
 	Blocked   int               `json:"blocked,string"`
 	IP        string            `json:"ip"`
 	HostName  string            `json:"hostname"`
-	UpSpeed   int               `json:"up_speed,string"`
-	DownSpeed int               `json:"down_speed,string"`
-	UpLimit   int               `json:"up_limit,string"`
-	DownLimit int               `json:"down_limit,string"`
+	UpSpeed   int64             `json:"up_speed,string"`
+	DownSpeed int64             `json:"down_speed,string"`
+	UpLimit   int64             `json:"up_limit,string"`
+	DownLimit int64             `json:"down_limit,string"`
 	IsCurHost int               `json:"is_cur_host,string"`
 	SSID      string            `json:"ssid"`
 	WifiMode  int               `json:"wifi_mode,string"`
@@ -95,6 +271,12 @@ func securityEncode(password string) (result string) {
 }
 
 func httpResponse(url, contentType string, body io.Reader, jbody interface{}, nocheck ...bool) error {
+	//
+	GHTTPLimit <- 1
+	//
+	defer func() {
+		<-GHTTPLimit
+	}()
 	//
 	if _body, ok := body.(interface {
 		Reload()
@@ -154,6 +336,9 @@ func main() {
 
 	var reboot string
 
+	var up int
+	var down int
+
 	flag.BoolVar(&debug, "d", false, "debug flag")
 
 	flag.StringVar(&address, "ip", "", "your tplink router's ip address")
@@ -162,6 +347,9 @@ func main() {
 	flag.StringVar(&httpaddr, "http", "", "your local http server")
 
 	flag.StringVar(&reboot, "reboot", "", "your tplink router's reboot time, eg: 3:15:15")
+
+	flag.IntVar(&up, "up", 0, "limit up")
+	flag.IntVar(&down, "down", 0, "limit down")
 
 	flag.Parse()
 
@@ -173,7 +361,13 @@ func main() {
 		//
 		var wanInfo *WANInfo
 		//
+		ctlchan := make(chan string, 1)
+		//
+		defer close(ctlchan)
+		//
 		go func() {
+			//
+			var speedLimit *SpeedLimit
 			//
 			loginFailed := 0
 			//
@@ -193,6 +387,43 @@ func main() {
 			reboot_request := strings.NewReader(
 				`{"method":"do","system":{"reboot":null}}`,
 			)
+			//
+			rebootFn := func() {
+				//
+				retry := 0
+				//
+				start := time.Now()
+				//
+				for 5 > retry {
+					//
+					if 30*time.Minute < time.Since(start) {
+						//
+						fmt.Println("timeout execute")
+						//
+						return
+					}
+					//
+					if "" != dsUrl {
+						if err := httpResponse(
+							dsUrl,
+							"application/json; charset=UTF-8",
+							reboot_request,
+							nil,
+						); nil == err {
+							return
+						} else if errors.Is(err, syscall.EACCES) {
+							//
+							retry++
+							//
+							time.Sleep(10 * time.Second)
+							//
+							continue
+						}
+					}
+					//
+					time.Sleep(3 * time.Second)
+				}
+			}
 			//
 			if "" != reboot {
 				if t, err := time.Parse("15:04:05", reboot); nil == err {
@@ -220,42 +451,7 @@ func main() {
 					if _, err := GCron.AddFunc(
 						reboot,
 						func() {
-							go func() {
-								//
-								retry := 0
-								//
-								start := time.Now()
-								//
-								for 5 > retry {
-									//
-									if 30*time.Minute < time.Since(start) {
-										//
-										fmt.Println("timeout execute")
-										//
-										return
-									}
-									//
-									if "" != dsUrl {
-										if err := httpResponse(
-											dsUrl,
-											"application/json; charset=UTF-8",
-											reboot_request,
-											nil,
-										); nil == err {
-											return
-										} else if errors.Is(err, syscall.EACCES) {
-											//
-											retry++
-											//
-											time.Sleep(10 * time.Second)
-											//
-											continue
-										}
-									}
-									//
-									time.Sleep(3 * time.Second)
-								}
-							}()
+							go rebootFn()
 						},
 					); nil != err {
 						fmt.Println(err)
@@ -287,7 +483,37 @@ func main() {
 				}
 			}()
 			//
+			go func() {
+				//
+				for {
+					select {
+					case msg, ok := <-ctlchan:
+						//
+						if ok {
+							//
+							switch msg {
+							case "reboot":
+								go rebootFn()
+							}
+						} else {
+							return
+						}
+					}
+				}
+			}()
+			//
+			if 0 < up && 0 < down {
+				//
+				speedLimit = &SpeedLimit{
+					up:   int64(up) * 1024,   // 上传
+					down: int64(down) * 1024, // 下载
+
+					m: make(map[string]*SpeedLimitValue),
+				}
+			}
+			//
 			for {
+				//
 				if "" == dsUrl && 5 > loginFailed {
 					//
 					result := struct {
@@ -352,13 +578,46 @@ func main() {
 						wanInfo = result.Network.WanStatus
 						//
 						if n := len(result.HostsInfo.OnlineHost); 0 < n {
+							//
 							hostsList = make([]*HostInfo, 0, n)
 							//
 							for _, item := range result.HostsInfo.OnlineHost {
+								//
 								for _, _item := range item {
+									//
 									hostsList = append(hostsList, _item)
+									//
+									if nil != speedLimit {
+										speedLimit.Update(_item.Mac, _item.HostName, _item.UpSpeed, _item.DownSpeed, _item.UpLimit, _item.DownLimit)
+									}
 								}
 							}
+						}
+						//
+						if nil != speedLimit {
+							//
+							speedLimit.Checking(func(mac, name string, up, down int64) {
+								//
+								//fmt.Println(mac, up, down)
+								//
+								go func(url, mac, name string, up, down int64) {
+									//
+									httpResponse(
+										url,
+										"application/json; charset=UTF-8",
+										strings.NewReader(
+											fmt.Sprintf(
+												`{"method":"do","hosts_info":{"set_block_flag":{"mac":"%s","is_blocked":"0","name":"%s","up_limit":%d,"down_limit":"%d"}}}`,
+												mac,
+												name,
+												up,
+												down,
+											),
+										),
+										nil,
+									)
+								}(dsUrl, mac, name, up, down)
+							})
 						}
 						//
 						mu.Unlock()
@@ -440,7 +699,7 @@ func main() {
 				return a2
 			}
 			// speed
-			pn := func(bps int) interface{} {
+			pn := func(bps int64) interface{} {
 				if 1000000 > bps {
 					return fmt.Sprintf("%.2f Kbps", float32(bps)/1000.0)
 				} else if 1000000000 > bps {
@@ -451,6 +710,23 @@ func main() {
 			}
 			//
 			fn := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				//
+				switch r.URL.Path {
+				case "/reboot":
+					//
+					select {
+					case <-ctlchan:
+					default:
+					}
+					//
+					ctlchan <- "reboot"
+					//
+					w.Header().Set("Location", "/")
+					//
+					w.WriteHeader(http.StatusFound)
+					//
+					return
+				}
 				//
 				fmt.Fprintf(
 					w,
@@ -499,7 +775,7 @@ table {
 		<td>连接时长</td>
 		<td>%s</td>
 		<td></td>
-		<td></td>
+		<td><a href="/reboot">马上重启</a></td>
 	</tr>
 	<tr>
 		<td>IP</td>
